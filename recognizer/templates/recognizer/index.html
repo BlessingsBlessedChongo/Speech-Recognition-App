@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech Recognition App</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/recognizer/styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1><i class="fas fa-microphone"></i> Speech Recognition</h1>
+        <p class="subtitle">Click the microphone button and start speaking</p>
+        
+        <div class="wave-container">
+            <canvas id="waveform" width="600" height="100"></canvas>
+            <div class="wave-labels">
+                <span class="wave-label">Silence</span>
+                <span class="wave-label">Active</span>
+            </div>
+        </div>
+        
+        <div class="controls">
+            <button id="startBtn" class="btn">
+                <i class="fas fa-microphone"></i> Start Recording
+            </button>
+            <button id="stopBtn" class="btn" disabled>
+                <i class="fas fa-stop"></i> Stop Recording
+            </button>
+        </div>
+        
+        <div class="status" id="status">Ready to record</div>
+        
+        <div class="result-container">
+            <h2>Result:</h2>
+            <div id="result"></div>
+            <div id="processingInfo"></div>
+        </div>
+    </div>
+
+    <div class="optimization-badge">
+        <i class="fas fa-bolt"></i> Optimized Mode
+    </div>
+
+    <script>
+        // DOM Elements
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const resultDiv = document.getElementById('result');
+        const statusDiv = document.getElementById('status');
+        const processingInfo = document.getElementById('processingInfo');
+        const waveformCanvas = document.getElementById('waveform');
+        const canvasCtx = waveformCanvas.getContext('2d');
+        
+        // Audio Variables
+        let mediaRecorder;
+        let audioChunks = [];
+        let audioContext;
+        let analyser;
+        let dataArray;
+        let animationId;
+        let stream;
+        let recordingStartTime;
+        
+        // Initialize Audio Context
+        function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+        
+        // Waveform Visualization
+        function drawWaveform() {
+            animationId = requestAnimationFrame(drawWaveform);
+            
+            analyser.getByteTimeDomainData(dataArray);
+            canvasCtx.fillStyle = 'rgb(240, 240, 240)';
+            canvasCtx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+            
+            canvasCtx.lineWidth = 2;
+            canvasCtx.strokeStyle = 'rgb(58, 143, 183)';
+            canvasCtx.beginPath();
+            
+            const sliceWidth = waveformCanvas.width / analyser.fftSize;
+            let x = 0;
+            
+            for (let i = 0; i < analyser.fftSize; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = v * waveformCanvas.height / 2;
+                
+                if (i === 0) {
+                    canvasCtx.moveTo(x, y);
+                } else {
+                    canvasCtx.lineTo(x, y);
+                }
+                
+                x += sliceWidth;
+            }
+            
+            canvasCtx.lineTo(waveformCanvas.width, waveformCanvas.height / 2);
+            canvasCtx.stroke();
+        }
+        
+        function stopWaveform() {
+            cancelAnimationFrame(animationId);
+            canvasCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+        }
+        
+        // Recording Control
+        async function startRecording() {
+            statusDiv.textContent = "Requesting microphone access...";
+            startBtn.disabled = true;
+            
+            try {
+                initAudioContext();
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        sampleRate: 16000
+                    } 
+                });
+                
+                // Set up audio analyzer
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                const source = audioContext.createMediaStreamSource(stream);
+                source.connect(analyser);
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                // Start visualization
+                drawWaveform();
+                
+                // Initialize recording
+                mediaRecorder = new MediaRecorder(stream, {
+                    mimeType: 'audio/webm;codecs=opus',
+                    audioBitsPerSecond: 16000
+                });
+                
+                audioChunks = [];
+                mediaRecorder.ondataavailable = event => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+                
+                mediaRecorder.onstop = sendAudioToServer;
+                mediaRecorder.start(100); // Collect data every 100ms
+                
+                recordingStartTime = Date.now();
+                statusDiv.textContent = "Recording... Speak now";
+                stopBtn.disabled = false;
+                
+                // Show recording timer
+                updateRecordingTime();
+                
+            } catch (error) {
+                handleRecordingError(error);
+            }
+        }
+        
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+                stopWaveform();
+                statusDiv.textContent = "Processing audio...";
+                stopBtn.disabled = true;
+                
+                // Stop all tracks
+                stream.getTracks().forEach(track => track.stop());
+            }
+        }
+        
+        function updateRecordingTime() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                const seconds = Math.floor((Date.now() - recordingStartTime) / 1000);
+                processingInfo.textContent = `Recording: ${seconds}s`;
+                setTimeout(updateRecordingTime, 1000);
+            }
+        }
+        
+        // Audio Processing
+        async function sendAudioToServer() {
+    try {
+        // Show loading state
+        resultDiv.innerHTML = '<div class="spinner"></div>';
+        processingInfo.innerHTML = '<div class="processing-time">Processing...</div>';
+        
+        // Convert to optimized audio format
+        const audioBlob = await processAudio(new Blob(audioChunks));
+        
+        // Validate audio
+        if (audioBlob.size < 2048) { // 2KB minimum
+            throw new Error("Recording too short - please speak for at least 1 second");
+        }
+        
+        // Create form data
+        const formData = new FormData();
+        formData.append('audio_data', audioBlob, 'recording.wav');
+        
+        // Send to server
+        const startTime = Date.now();
+        const response = await fetch('/api/recognize/', {
+            method: 'POST',
+            body: formData,
+            headers: {
+                'X-CSRFToken': getCookie('csrftoken'),
+                'X-Audio-Format': 'processed-wav'
+            }
+        });
+        
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || error.solution || "Recognition failed");
+        }
+        
+        // Display results
+        const result = await response.json();
+        resultDiv.textContent = result.text;
+        processingInfo.innerHTML = `
+            <div class="success-message">
+                Processed in ${result.processing_time}
+            </div>
+        `;
+        
+    } catch (error) {
+        handleProcessingError(error);
+    } finally {
+        startBtn.disabled = false;
+    }
+}
+
+async function processAudio(blob) {
+    try {
+        // Create audio context
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 16000 // Standard for speech recognition
+        });
+        
+        // Decode audio data
+        const arrayBuffer = await blob.arrayBuffer();
+        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+        
+        // Create mono version if stereo
+        let sourceBuffer = audioBuffer;
+        if (audioBuffer.numberOfChannels > 1) {
+            sourceBuffer = convertToMono(audioBuffer);
+        }
+        
+        // Normalize volume
+        const normalizedBuffer = normalizeAudio(sourceBuffer);
+        
+        // Convert to WAV
+        return bufferToWav(normalizedBuffer);
+        
+    } catch (error) {
+        console.warn("Audio processing failed, sending original:", error);
+        return blob; // Fallback to original
+    }
+}
+
+function convertToMono(buffer) {
+    const monoBuffer = audioContext.createBuffer(
+        1, 
+        buffer.length, 
+        buffer.sampleRate
+    );
+    
+    const monoData = monoBuffer.getChannelData(0);
+    for (let i = 0; i < buffer.length; i++) {
+        let sum = 0;
+        for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+            sum += buffer.getChannelData(channel)[i];
+        }
+        monoData[i] = sum / buffer.numberOfChannels;
+    }
+    
+    return monoBuffer;
+}
+
+function normalizeAudio(buffer) {
+    // Find maximum amplitude
+    let max = 0;
+    for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+        const channelData = buffer.getChannelData(channel);
+        for (let i = 0; i < channelData.length; i++) {
+            max = Math.max(max, Math.abs(channelData[i]));
+        }
+    }
+    
+    // Normalize if needed
+    if (max > 0 && max < 1) {
+        const normalizedBuffer = audioContext.createBuffer(
+            buffer.numberOfChannels,
+            buffer.length,
+            buffer.sampleRate
+        );
+        
+        for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+            const channelData = buffer.getChannelData(channel);
+            const normalizedData = normalizedBuffer.getChannelData(channel);
+            for (let i = 0; i < channelData.length; i++) {
+                normalizedData[i] = channelData[i] / max;
+            }
+        }
+        
+        return normalizedBuffer;
+    }
+    
+    return buffer;
+}
+
+        
+        // Audio Conversion
+        async function convertToWav(blob) {
+            return new Promise((resolve) => {
+                // For small recordings, skip conversion
+                if (blob.size < 50000) {  // ~5s of audio
+                    resolve(blob);
+                    return;
+                }
+                
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+                
+                const fileReader = new FileReader();
+                fileReader.onload = function() {
+                    audioContext.decodeAudioData(this.result)
+                        .then(buffer => {
+                            const offlineCtx = new OfflineAudioContext(
+                                buffer.numberOfChannels,
+                                buffer.length / (audioContext.sampleRate / 16000),
+                                16000
+                            );
+                            
+                            const source = offlineCtx.createBufferSource();
+                            source.buffer = buffer;
+                            source.connect(offlineCtx.destination);
+                            source.start();
+                            
+                            return offlineCtx.startRendering();
+                        })
+                        .then(downsampledBuffer => {
+                            resolve(bufferToWav(downsampledBuffer));
+                        })
+                        .catch(() => resolve(blob));  // Fallback to original
+                };
+                fileReader.readAsArrayBuffer(blob);
+            });
+        }
+        
+        function bufferToWav(buffer) {
+            const numOfChan = buffer.numberOfChannels;
+            const length = buffer.length * numOfChan * 2 + 44;
+            const bufferArray = new ArrayBuffer(length);
+            const view = new DataView(bufferArray);
+            const channels = [];
+            let offset = 0;
+            let pos = 0;
+            
+            // Write WAV header
+            setUint32(0x46464952); // "RIFF"
+            setUint32(length - 8); // file length - 8
+            setUint32(0x45564157); // "WAVE"
+            setUint32(0x20746d66); // "fmt " chunk
+            setUint32(16); // length = 16
+            setUint16(1); // PCM (uncompressed)
+            setUint16(numOfChan);
+            setUint32(buffer.sampleRate);
+            setUint32(buffer.sampleRate * 2 * numOfChan); // avg. bytes/sec
+            setUint16(numOfChan * 2); // block-align
+            setUint16(16); // 16-bit
+            setUint32(0x61746164); // "data" - chunk
+            setUint32(length - pos - 4); // chunk length
+            
+            // Write interleaved data
+            for (let i = 0; i < buffer.numberOfChannels; i++) {
+                channels.push(buffer.getChannelData(i));
+            }
+            
+            while (pos < length) {
+                for (let i = 0; i < numOfChan; i++) {
+                    const sample = Math.max(-1, Math.min(1, channels[i][offset]));
+                    const val = sample < 0 ? sample * 32768 : sample * 32767;
+                    view.setInt16(pos, val, true);
+                    pos += 2;
+                }
+                offset++;
+            }
+            
+            return new Blob([view], { type: 'audio/wav' });
+            
+            function setUint16(data) {
+                view.setUint16(pos, data, true);
+                pos += 2;
+            }
+            
+            function setUint32(data) {
+                view.setUint32(pos, data, true);
+                pos += 4;
+            }
+        }
+        
+        // Helper Functions
+        function fetchWithTimeout(url, options) {
+            const { timeout, ...fetchOptions } = options;
+            
+            return new Promise((resolve, reject) => {
+                const timeoutId = setTimeout(() => {
+                    reject(new Error("Request timeout"));
+                }, timeout);
+
+                fetch(url, fetchOptions)
+                    .then(response => {
+                        clearTimeout(timeoutId);
+                        resolve(response);
+                    })
+                    .catch(error => {
+                        clearTimeout(timeoutId);
+                        reject(error);
+                    });
+            });
+        }
+        
+        function getCookie(name) {
+            let cookieValue = null;
+            if (document.cookie && document.cookie !== '') {
+                const cookies = document.cookie.split(';');
+                for (let i = 0; i < cookies.length; i++) {
+                    const cookie = cookies[i].trim();
+                    if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                        break;
+                    }
+                }
+            }
+            return cookieValue;
+        }
+        
+        // Error Handling
+        function handleRecordingError(error) {
+            console.error("Recording error:", error);
+            let errorMessage = "Recording failed";
+            
+            if (error.name === "NotAllowedError") {
+                errorMessage = "Please allow microphone access to use this feature";
+            } else if (error.name === "NotFoundError") {
+                errorMessage = "No microphone found";
+            } else if (error.name === "NotSupportedError") {
+                errorMessage = "Browser doesn't support audio recording";
+            }
+            
+            statusDiv.innerHTML = `<span class="error">${errorMessage}</span>`;
+            startBtn.disabled = false;
+        }
+        
+        function handleProcessingError(error) {
+            console.error("Processing error:", error);
+            
+            let userMessage = "Processing error occurred";
+            let technicalDetails = "";
+            
+            if (error.message.includes("Failed to fetch")) {
+                userMessage = "Network error - please check your connection";
+            } else if (error.message.includes("timeout")) {
+                userMessage = "Processing took too long - try a shorter recording";
+            } else if (error.message.includes("audio")) {
+                userMessage = "Audio problem - try speaking louder or closer to mic";
+            }
+            
+            technicalDetails = `Technical details: ${error.message}`;
+            
+            statusDiv.innerHTML = `
+                <span class="error">${userMessage}</span>
+                <div class="error-details">${technicalDetails}</div>
+            `;
+            resultDiv.textContent = "";
+            processingInfo.textContent = "";
+            
+            // Show a "Try Again" button
+            const tryAgainBtn = document.createElement('button');
+            tryAgainBtn.textContent = 'Try Again';
+            tryAgainBtn.className = 'btn try-again';
+            tryAgainBtn.onclick = () => {
+                statusDiv.textContent = 'Ready to record';
+                resultDiv.textContent = '';
+                processingInfo.textContent = '';
+                tryAgainBtn.remove();
+            };
+            statusDiv.appendChild(tryAgainBtn);
+        }
+        
+        // Event Listeners
+        startBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+    </script>
+</body>
+</html>
